@@ -6,6 +6,9 @@ import locale
 import random
 import threading
 import time
+import shutil
+import subprocess
+import tempfile
 
 # libmpv (mpv-2.dll sous Windows) est cherchée à côté du programme
 BASE = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
@@ -21,6 +24,7 @@ from PySide6.QtWidgets import (
     QFileDialog, QMessageBox, QInputDialog, QLineEdit, QAbstractItemView, QScrollArea, QFrame)
 
 import filters as F
+import shaders as S
 
 URL_PREFIX = ("http://", "https://", "rtmp://", "rtsp://")
 VIDEO_EXT = (".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".mpg", ".mpeg", ".m4v",
@@ -41,6 +45,10 @@ QSlider::groove:horizontal{height:4px;background:#2e3040;border-radius:2px}
 QSlider::sub-page:horizontal{background:#3fd0d4;border-radius:2px}
 QSlider::handle:horizontal{width:12px;margin:-5px 0;border-radius:6px;background:#f0558a}
 """
+
+
+def fmt_t(t):
+    return f"{int(t) // 60}:{int(t) % 60:02d}"
 
 
 def fmt(s):
@@ -274,14 +282,22 @@ class Win(QMainWindow):
         self.scr.addItems(list(F.SCRAMBLERS))
         self.look.currentIndexChanged.connect(self.apply_video)
         self.scr.currentIndexChanged.connect(self.on_scrambler)
+        self.pvmode = QComboBox()
+        self.pvmode.addItems(["Shaders GPU (temps réel)", "Filtres FFmpeg (précis, lent)", "Aucun effet en direct"])
+        self.pvmode.currentIndexChanged.connect(self.apply_video)
+        f.addRow("Aperçu direct", self.pvmode)
+        pv = QPushButton("Aperçu rendu (10 s, via FFmpeg)")
+        pv.clicked.connect(self.preview)
+        f.addRow(pv)
         for lab, wd in (("Rendu", self.look), ("Intensité du rendu", self.lookk),
                         ("Sparklies (quantité)", self.spk), ("Mauvaise réception", self.rcp),
                         ("Destruction couleurs PAL", self.pald), ("Cryptage", self.scr)):
             f.addRow(lab, wd)
-        n = QLabel("Rendus : VHS, Betamax, LaserDisc, ou lecteur QuickTime sous Windows 95 (240×180, 15 i/s, "
-                   "256 couleurs). Les modes de cryptage sont des simulations visuelles (coupe et rotation de "
-                   "lignes, permutation de lignes, inversion vidéo) : ils ne chiffrent rien. Le choix d’un "
-                   "système règle aussi la norme TV d’origine. Ces effets sont gourmands : gardez l’aperçu allégé.")
+        n = QLabel("En direct, les effets tournent sur la carte graphique (shaders) : c’est une approximation "
+                   "rapide. L’aperçu rendu et l’export utilisent FFmpeg, plus fidèle, mais hors temps réel. "
+                   "Le direct ne change ni la cadence ni la forme de l’image (pas de 25 i/s ni de bandes "
+                   "noires). Les modes de cryptage sont des simulations visuelles : ils ne chiffrent rien. "
+                   "Le choix d’un système règle aussi la norme TV d’origine.")
         n.setWordWrap(True)
         n.setStyleSheet("color:#8d90a0")
         f.addRow(n)
@@ -379,10 +395,24 @@ class Win(QMainWindow):
 
     # ---------- moteur mpv ----------
     def _start_mpv(self):
-        self.mp = self.mpv.MPV(wid=str(int(self.video.winId())), input_default_bindings=False,
-                               input_vo_keyboard=True, osc=False, keep_open="yes", hwdec="auto-safe",
-                               sub_auto="fuzzy", screenshot_format="png")
         gui = self.bridge.call.emit
+        self.logfile = os.path.join(os.path.expanduser("~"), "twins_player.log")
+        self.seen_err = set()
+
+        def log(level, comp, text):
+            if level in ("error", "fatal", "warn"):
+                try:
+                    with open(self.logfile, "a", encoding="utf-8") as fh:
+                        fh.write(f"[{level}] {comp}: {text}")
+                except OSError:
+                    pass
+                if level in ("error", "fatal") and text not in self.seen_err:
+                    self.seen_err.add(text)
+                    gui(lambda: self.statusBar().showMessage(f"mpv ({comp}) : {text.strip()}", 15000))
+        # auto-copy : les filtres logiciels (effets) ont besoin d'images en mémoire système
+        self.mp = self.mpv.MPV(wid=str(int(self.video.winId())), input_default_bindings=False,
+                               input_vo_keyboard=True, osc=False, keep_open="yes", hwdec="auto-copy",
+                               sub_auto="fuzzy", screenshot_format="png", log_handler=log, loglevel="warn")
         self.mp.observe_property("time-pos", lambda n, v: gui(lambda: self.on_pos(v)))
         self.mp.observe_property("duration", lambda n, v: gui(lambda: self.tdur.setText(fmt(v))))
         self.mp.observe_property("pause", lambda n, v: gui(lambda: self.bplay.setText("Lecture" if v else "Pause")))
@@ -486,6 +516,10 @@ class Win(QMainWindow):
             self.statusBar().showMessage("Fichier introuvable", 4000)
             return
         self.cur = path
+        if getattr(self, "preview_on", False):
+            self.preview_on = False
+            self.apply_video()
+            self.apply_audio()
         t = float(self.cfg.value("pos/" + self.key_of(path), 0) or 0)
         self.mp["start"] = str(int(t)) if t > 8 else "none"
         self.mp.play(path)
@@ -705,7 +739,7 @@ class Win(QMainWindow):
             self.refresh_bkm()
 
     # ---------- audio / vidéo ----------
-    def audio_cfg(self):
+    def audio_raw(self):
         mode = F.AUDIO_MODES[self.amode.currentText()]
         out51 = self.aout.currentIndex() == 1
         graph = F.audio_graph(mode, out51, self.slev.value() / 100, self.clev.value() / 100,
@@ -715,7 +749,11 @@ class Win(QMainWindow):
             ch = "5.1"
         else:
             ch = "stereo" if graph else "auto-safe"
-        return F.mpv_wrap(graph), ch
+        return graph, ch
+
+    def audio_cfg(self):
+        g, ch = self.audio_raw()
+        return F.mpv_wrap(g), ch
 
     def apply_audio(self):
         af, ch = self.audio_cfg()
@@ -747,16 +785,105 @@ class Win(QMainWindow):
         self.mp["video-aspect-override"] = ["-1", "4:3", "16:9", "2.35:1"][self.asp.currentIndex()]
 
     def apply_video(self):
+        mode = self.pvmode.currentIndex()               # 0 shaders, 1 FFmpeg (lavfi), 2 aucun
         try:
-            self.mp["vf"] = self.video_cfg()
+            if mode == 1:
+                vf, shader = self.video_cfg(), ""
+            else:                                       # seules les corrections de base passent par lavfi
+                o = dict(self.video_opts(False), look=None, sparkle=0, reception=0, pal_destroy=0,
+                         scrambler=None, scan=False)
+                vf = F.mpv_wrap(F.video_graph("Original", self.dar.currentText(), o))
+                shader = S.build_shader(self.std.currentText(), self.video_opts(False)) if mode == 0 else ""
+            self.mp["vf"] = vf
+            self.set_shader(shader)
         except Exception as e:
             self.mp["vf"] = ""
-            self.statusBar().showMessage(f"Filtre vidéo refusé par mpv : {e}", 6000)
+            msg = str(e)
+            if msg not in self.seen_err:
+                self.seen_err.add(msg)
+                QMessageBox.warning(self, "Effet refusé par mpv",
+                                    f"{msg}\n\nLes effets sont désactivés. Détails : {self.logfile}\n"
+                                    "Essayez l'aperçu rendu (onglet Effets) ou l'export, qui utilisent FFmpeg.")
+
+    def set_shader(self, text):
+        old = getattr(self, "shader_file", None)
+        if text:
+            self.shader_n = getattr(self, "shader_n", 0) + 1
+            path = os.path.join(tempfile.gettempdir(), f"twins_fx_{os.getpid()}_{self.shader_n}.glsl")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            self.mp["glsl-shaders"] = [path]
+            self.shader_file = path
+        else:
+            self.mp["glsl-shaders"] = []
+            self.shader_file = None
+        if old and os.path.exists(old):
+            try:
+                os.remove(old)
+            except OSError:
+                pass
 
     def apply_fit(self):
         i = self.fit.currentIndex()
         self.mp["keepaspect"] = "no" if i == 2 else "yes"
         self.mp["panscan"] = 1.0 if i == 1 else 0.0
+
+    # ---------- FFmpeg (aperçu rendu et export) ----------
+    def ffmpeg(self):
+        for c in (os.path.join(BASE, "ffmpeg.exe"), os.path.join(BASE, "ffmpeg")):
+            if os.path.isfile(c):
+                return c
+        return shutil.which("ffmpeg")
+
+    def run_ffmpeg(self, cmd, label, on_line=None):
+        """Lance FFmpeg ; retourne (ok, derniers messages)."""
+        flags = 0x08000000 if os.name == "nt" else 0          # pas de console sous Windows
+        pr = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                              encoding="utf-8", errors="ignore", creationflags=flags)
+        tail = []
+        for line in pr.stdout:
+            line = line.strip()
+            if line.startswith("out_time_ms=") and on_line:
+                try:
+                    on_line(int(line.split("=")[1]) / 1e6)
+                except ValueError:
+                    pass
+            elif "=" not in line or line.startswith("error"):
+                tail = (tail + [line])[-8:]
+        return pr.wait() == 0, "\n".join(tail)
+
+    def preview(self):
+        """Pré-rend 10 s avec FFmpeg puis les lit : montre les effets même si le direct échoue."""
+        ff = self.ffmpeg()
+        if not self.cur or self.cur.startswith(URL_PREFIX):
+            self.statusBar().showMessage("Chargez d'abord un fichier local", 5000)
+            return
+        if not ff:
+            QMessageBox.warning(self, "FFmpeg introuvable", "Placez ffmpeg à côté du programme ou dans le PATH.")
+            return
+        vf = F.video_graph(self.std.currentText(), self.dar.currentText(), self.video_opts(self.light.isChecked()))
+        af, _ = self.audio_raw()
+        out = os.path.join(tempfile.gettempdir(), "twins_preview.mp4")
+        start, src, gui = self.prop("time-pos") or 0, self.cur, self.bridge.call.emit
+        cmd = F.ffmpeg_cmd(ff, src, out, "MP4 (H.264 + AAC)", vf, af, 23, start=start, duration=10)
+        cmd[cmd.index("medium")] = "ultrafast"
+        self.statusBar().showMessage("Rendu de l'aperçu (10 s)…")
+
+        def work():
+            ok, msg = self.run_ffmpeg(cmd, "aperçu")
+            gui(lambda: self.play_preview(out) if ok else QMessageBox.warning(self, "Aperçu impossible", msg))
+        threading.Thread(target=work, daemon=True).start()
+
+    def play_preview(self, out):
+        self.preview_on = True
+        for k, v in (("vf", ""), ("af", ""), ("glsl-shaders", []), ("start", "none")):
+            try:
+                self.mp[k] = v
+            except Exception:
+                pass
+        self.mp.play(out)
+        self.mp.pause = False
+        self.statusBar().showMessage("Aperçu rendu par FFmpeg. Rechargez un fichier de la liste pour revenir au direct.", 10000)
 
     # ---------- export (conversion réelle) ----------
     def export(self):
@@ -783,9 +910,22 @@ class Win(QMainWindow):
         af, ch = self.audio_cfg() if self.eaaud.isChecked() else ("", "auto-safe")
         vopts = F.video_opts(self.efmt.currentText(), self.eq_q.value())
         mpv, gui = self.mpv, self.bridge.call.emit
+        ff = self.ffmpeg()
+        raw_v = F.video_graph(self.std.currentText(), self.dar.currentText(), self.video_opts(False)) \
+            if self.eavid.isChecked() and fmt["video"] else ""
+        raw_a = self.audio_raw()[0] if self.eaaud.isChecked() else ""
+        fname, q = self.efmt.currentText(), self.eq_q.value()
 
         def work():
             for n, (src, out) in enumerate(jobs, 1):
+                if ff:                                  # voie FFmpeg : mêmes graphes, testés hors lecteur
+                    ok, msg = self.run_ffmpeg(
+                        F.ffmpeg_cmd(ff, src, out, fname, raw_v, raw_a, q), "export",
+                        lambda t, n=n: gui(lambda: self.statusBar().showMessage(f"Export {n}/{len(jobs)} : {fmt_t(t)}")))
+                    if not ok:
+                        gui(lambda msg=msg, src=src: QMessageBox.warning(
+                            self, "Export impossible", f"{os.path.basename(src)} :\n{msg}"))
+                    continue
                 try:
                     kw = dict(o=out, oac=fmt["oac"], af=af, audio_channels="5.1" if ch == "5.1" else "stereo",
                               keep_open="no")
@@ -818,6 +958,11 @@ class Win(QMainWindow):
 
     def closeEvent(self, e):
         self.cfg.setValue("list", self.paths())
+        if getattr(self, "shader_file", None) and os.path.exists(self.shader_file):
+            try:
+                os.remove(self.shader_file)
+            except OSError:
+                pass
         try:
             self.mp.terminate()
         except Exception:

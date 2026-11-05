@@ -274,5 +274,35 @@ def video_graph(std="Original", aspect="4:3", o=None):
     return ",".join(f)
 
 
+def ffmpeg_cmd(ff, src, out, fmt_name, vf="", af="", quality=20, start=None, duration=None):
+    """Commande FFmpeg complète pour exporter avec les mêmes graphes que le lecteur."""
+    fmt = EXPORT_FORMATS[fmt_name]
+    c = [ff, "-y", "-hide_banner", "-loglevel", "error", "-progress", "pipe:1", "-nostats"]
+    if start:
+        c += ["-ss", str(start)]
+    c += ["-i", src]
+    if duration:
+        c += ["-t", str(duration)]
+    if fmt["video"]:
+        if vf:
+            c += ["-vf", vf]
+        ovc = fmt["ovc"]
+        if ovc == "libx264":
+            c += ["-c:v", "libx264", "-crf", str(quality), "-preset", "medium", "-pix_fmt", "yuv420p"]
+        elif ovc == "libvpx-vp9":
+            c += ["-c:v", "libvpx-vp9", "-crf", str(quality + 8), "-b:v", "0", "-pix_fmt", "yuv420p"]
+        else:
+            c += ["-c:v", "mpeg4", "-q:v", str(max(1, (quality - 14) // 2 + 2)), "-pix_fmt", "yuv420p"]
+    else:
+        c += ["-vn"]
+    if af:
+        c += ["-af", af]
+    c += ["-c:a", fmt["oac"]]
+    if fmt["ext"] in ("mp3", "avi"):
+        c += ["-ac", "2"]
+    c.append(out)
+    return c
+
+
 def mpv_wrap(graph):
     return f"lavfi=[{graph}]" if graph else ""
