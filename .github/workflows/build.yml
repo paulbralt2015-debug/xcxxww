@@ -24,8 +24,14 @@ jobs:
           7z x mpv-dev.7z -ompvdev -y
           ls mpvdev
           cp "$(find mpvdev -name 'libmpv-2.dll' -o -name 'mpv-2.dll' | head -n1)" mpv-2.dll
+      - name: Télécharger FFmpeg (aperçu rendu et export)
+        shell: bash
+        run: |
+          curl -L -o ff.zip https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip
+          7z x ff.zip -offmpegdir -y
+          cp "$(find ffmpegdir -name ffmpeg.exe | head -n1)" ffmpeg.exe
       - name: Construire l'exe
-        run: pyinstaller --onefile --windowed --name TwinsVideoPlayer2 --add-binary "mpv-2.dll;." --add-data "filters.py;." twins_player.py
+        run: pyinstaller --onefile --windowed --name TwinsVideoPlayer2 --add-binary "mpv-2.dll;." --add-binary "ffmpeg.exe;." --add-data "filters.py;." twins_player.py
       - uses: actions/upload-artifact@v4
         with:
           name: TwinsVideoPlayer2-windows
